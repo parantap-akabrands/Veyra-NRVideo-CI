@@ -1,0 +1,389 @@
+name: Independent Veyra build + security scan
+
+# Builds Veyra from the upstream author's source at an exact commit, with every
+# dependency fetched from its original vendor at a pinned commit, on a clean
+# GitHub-hosted Windows runner. Publishes SHA-256 sums and a signed build
+# provenance attestation, and scans both this build and the author's official
+# release with Microsoft Defender and ClamAV.
+
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+    inputs:
+      veyra_ref:
+        description: 'Full commit SHA of Likely7/Veyra-NRVideo to build (default: the 2.1.9 product commit)'
+        required: false
+        default: 'b430d986c2adace6eae6cd2893fbb7a491473aaa'
+      official_tag:
+        description: 'Official release tag to download, scan and compare against'
+        required: false
+        default: 'v2.1.9'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: independent-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: Likely7/Veyra-NRVideo
+  VEYRA_REF: ${{ inputs.veyra_ref || 'b430d986c2adace6eae6cd2893fbb7a491473aaa' }}
+  OFFICIAL_TAG: ${{ inputs.official_tag || 'v2.1.9' }}
+  # vcpkg commit = Veyra's own vcpkg.json builtin-baseline (ffmpeg 9.0.1#1, dav1d 1.5.4, zlib 1.3.2)
+  VCPKG_COMMIT: 30ef65cad98f08e7197c9a1656fbd871bcb72f2d
+  QT_VERSION: '6.8.3'
+
+jobs:
+  build:
+    name: Build on windows-2022
+    runs-on: windows-2022
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      id-token: write       # build provenance attestation (Sigstore)
+      attestations: write
+    defaults:
+      run:
+        # Stop on the first failing cmdlet or native command (pwsh does not by default).
+        shell: pwsh -NoProfile -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+    steps:
+      - name: Checkout CI scripts
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          path: ci-repo
+          persist-credentials: false
+
+      - name: Checkout upstream Veyra source at the pinned commit
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.VEYRA_REF }}
+          path: veyra
+          persist-credentials: false
+
+      - name: Verify source commit
+        run: |
+          $head = (git -C veyra rev-parse HEAD).Trim()
+          if ($head -ne $env:VEYRA_REF) { throw "Checked out $head, expected $env:VEYRA_REF" }
+          "Building $env:UPSTREAM_REPO@$head" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          # Nothing proprietary may come from the author: third_party_local must not exist in Git.
+          if (Test-Path veyra/third_party_local) { throw 'third_party_local unexpectedly present in source' }
+
+      - name: Stage vendor SDKs (pinned commits)
+        run: ci-repo/ci/fetch-sdks.ps1 -VeyraRoot veyra -WorkRoot C:\sdk-src -ManifestOut C:\sdk-manifest.json
+
+      - name: Install Qt ${{ env.QT_VERSION }} (official Qt binaries)
+        uses: jurplel/install-qt-action@d325aaf2a8baeeda41ad0b5d39f84a6af9bcf005 # v4.3.0
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2022_64
+          cache: false
+
+      - name: MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Fetch vcpkg at Veyra's baseline
+        run: |
+          git init -q C:\v
+          git -C C:\v remote add origin https://github.com/microsoft/vcpkg.git
+          git -C C:\v fetch -q --depth 1 origin $env:VCPKG_COMMIT
+          git -C C:\v -c advice.detachedHead=false checkout -q FETCH_HEAD
+          if ((git -C C:\v rev-parse HEAD).Trim() -ne $env:VCPKG_COMMIT) { throw 'vcpkg commit mismatch' }
+          C:\v\bootstrap-vcpkg.bat -disableMetrics
+          python ci-repo/ci/make-ffmpeg-overlay.py C:\v veyra C:\vcpkg-overlay
+          $key = (Get-ChildItem C:\vcpkg-overlay -Recurse -File | Get-FileHash -Algorithm SHA256 | ForEach-Object Hash) -join ''
+          $keyHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($key)))
+          "OVERLAY_HASH=$keyHash" >> $env:GITHUB_ENV
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: C:\vcache
+          key: vcpkg-${{ env.VCPKG_COMMIT }}-${{ env.OVERLAY_HASH }}-v1
+
+      - name: Build FFmpeg 9.0.1 (+ Veyra patches), dav1d, zlib and libass from source
+        env:
+          VCPKG_BINARY_SOURCES: clear;files,C:\vcache,readwrite
+          VCPKG_DISABLE_METRICS: '1'
+        run: |
+          New-Item -ItemType Directory -Force C:\vcache | Out-Null
+          C:\v\vcpkg.exe install --overlay-ports=C:\vcpkg-overlay --clean-after-build `
+            'ffmpeg[core,avcodec,avformat,avfilter,swresample,swscale,dav1d,zlib]:x64-windows' `
+            'libass:x64-windows-static-md'
+          C:\v\vcpkg.exe list | Tee-Object C:\vcpkg-list.txt
+          if (-not (Test-Path C:\v\installed\x64-windows\include\libavfilter\avfilter.h)) { throw 'avfilter missing' }
+          Select-String -Path C:\v\buildtrees\ffmpeg\src\*\libavcodec\h264dec.h -Pattern 'MAX_SLICES 256' -ErrorAction SilentlyContinue | Out-Null
+
+      - name: Configure (CMake preset x64-release)
+        working-directory: veyra
+        run: |
+          $libass = 'C:/v/installed/x64-windows-static-md'
+          cmake --preset x64-release -B C:\b `
+            -DVEYRA_BUILD_QML_UI=ON `
+            -DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON `
+            "-DVEYRA_DLSS_SDK_ROOT=$((Resolve-Path third_party_local/nvidia/DLSS_SDK_310.7.0).Path)" `
+            -DVEYRA_FFMPEG_ROOT=C:/v/installed/x64-windows `
+            "-DVEYRA_LIBASS_ROOT=$libass" `
+            "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR"
+          Get-Content C:\b\CMakeCache.txt | Select-String -Pattern '^(VEYRA_|Qt6_DIR|CMAKE_BUILD_TYPE|CMAKE_CXX_COMPILER:)' | Tee-Object C:\cmake-cache-summary.txt
+
+      - name: Compile veyra_qml_ui and shaders
+        run: |
+          cmake --build C:\b --target veyra_qml_ui --parallel
+          $shaderTargets = ninja -C C:\b -t targets all | ForEach-Object { ($_ -split ':')[0] } | Where-Object { $_ -match '^veyra_shader_' } | Sort-Object -Unique
+          if ($shaderTargets) { cmake --build C:\b --parallel --target @shaderTargets }
+
+      - name: Stage portable package
+        run: |
+          $short = $env:VEYRA_REF.Substring(0, 10)
+          $name = "Veyra-independent-$short"
+          $stage = "C:\out\$name"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item C:\b\veyra_qml_ui.exe $stage
+          New-Item -ItemType Directory -Force "$stage\qml" | Out-Null
+          Copy-Item C:\b\qml\Veyra "$stage\qml\Veyra" -Recurse
+          Get-ChildItem C:\b\shaders -Recurse -Filter *.dxil | ForEach-Object {
+            $rel = $_.FullName.Substring((Resolve-Path C:\b\shaders).Path.Length + 1)
+            $dst = Join-Path "$stage\shaders" $rel
+            New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
+            Copy-Item $_.FullName $dst
+          }
+          Copy-Item C:\v\installed\x64-windows\bin\*.dll $stage
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --qmldir veyra\qml --no-translations `
+            --skip-plugin-types qmltooling,generic "$stage\veyra_qml_ui.exe"
+          Copy-Item "$env:VCToolsRedistDir\x64\Microsoft.VC143.CRT\*.dll" $stage
+          New-Item -ItemType Directory -Force "$stage\licenses" | Out-Null
+          foreach ($f in 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md') { Copy-Item "veyra\$f" $stage }
+          Copy-Item veyra\licenses\* "$stage\licenses" -Recurse
+          Copy-Item C:\v\installed\x64-windows\share\ffmpeg\copyright "$stage\licenses\FFMPEG-COPYRIGHT.txt"
+          Copy-Item C:\v\installed\x64-windows\share\dav1d\copyright "$stage\licenses\DAV1D-COPYRIGHT.txt"
+          Copy-Item C:\v\installed\x64-windows-static-md\share\libass\copyright "$stage\licenses\LIBASS-COPYRIGHT.txt"
+          "STAGE=$stage" >> $env:GITHUB_ENV
+          "PKG=$name" >> $env:GITHUB_ENV
+
+      - name: Vendor runtime DLLs (official, signed; separate folder)
+        run: |
+          # Optional GPU runtimes Veyra loads at run time, taken byte-for-byte from the vendors'
+          # own repositories and required to carry a valid Authenticode signature. The
+          # nvngx_dlssnr.dll (neural denoise) runtime is NOT publicly distributed by NVIDIA and
+          # is intentionally not included.
+          $rt = "C:\out\vendor-runtime"
+          $map = @(
+            @{ src = 'C:\sdk-src\DLSS\lib\Windows_x86_64\rel\nvngx_dlss.dll';  dst = 'runtime\experimental\nvngx_dlss.dll' },
+            @{ src = 'C:\sdk-src\DLSS\lib\Windows_x86_64\rel\nvngx_dlssg.dll'; dst = 'runtime\experimental\nvngx_dlssg.dll' },
+            @{ src = 'C:\sdk-src\xess\bin\libxell.dll';    dst = 'runtime_local\intel\experimental\libxell.dll' },
+            @{ src = 'C:\sdk-src\xess\bin\libxess_fg.dll'; dst = 'runtime_local\intel\experimental\libxess_fg.dll' },
+            @{ src = 'C:\sdk-src\FidelityFX-SDK\Kits\FidelityFX\signedbin\amd_fidelityfx_loader_dx12.dll';          dst = 'runtime_local\amd\fidelityfx\amd_fidelityfx_loader_dx12.dll' },
+            @{ src = 'C:\sdk-src\FidelityFX-SDK\Kits\FidelityFX\signedbin\amd_fidelityfx_framegeneration_dx12.dll'; dst = 'runtime_local\amd\fidelityfx\amd_fidelityfx_framegeneration_dx12.dll' },
+            @{ src = 'C:\sdk-src\FidelityFX-SDK\Kits\FidelityFX\signedbin\amd_fidelityfx_upscaler_dx12.dll';        dst = 'runtime_local\amd\fidelityfx\amd_fidelityfx_upscaler_dx12.dll' }
+          )
+          $rows = foreach ($m in $map) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $m.src
+            if ($sig.Status -ne 'Valid') { throw "$($m.src): signature $($sig.Status)" }
+            $dst = Join-Path $rt $m.dst
+            New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
+            Copy-Item -LiteralPath $m.src $dst
+            [pscustomobject]@{ path = $m.dst; sha256 = (Get-FileHash $dst).Hash; signature = $sig.Status; signer = $sig.SignerCertificate.Subject }
+          }
+          $rows | Format-Table -AutoSize | Out-String -Width 400 | Tee-Object "$rt\SIGNATURES.txt"
+
+      - name: Hashes, build info and archive
+        run: |
+          $stage = $env:STAGE
+          Push-Location $stage
+          Get-ChildItem -Recurse -File | Sort-Object FullName | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant(), (Resolve-Path -Relative $_.FullName).Substring(2).Replace('\','/')
+          } | Set-Content -Encoding utf8 C:\out\SHA256SUMS-files.txt
+          Pop-Location
+          $info = [ordered]@{
+            upstream = $env:UPSTREAM_REPO; sourceCommit = $env:VEYRA_REF
+            ciRepository = $env:GITHUB_REPOSITORY; ciCommit = $env:GITHUB_SHA
+            runId = $env:GITHUB_RUN_ID; runnerImage = "$env:ImageOS $env:ImageVersion"
+            msvcToolset = $env:VCToolsVersion; windowsSdk = $env:WindowsSDKVersion
+            cmake = (cmake --version | Select-Object -First 1); qt = $env:QT_VERSION
+            vcpkgCommit = $env:VCPKG_COMMIT; vcpkgPackages = (Get-Content C:\vcpkg-list.txt)
+            sdks = (Get-Content C:\sdk-manifest.json -Raw | ConvertFrom-Json)
+            cmakeCache = (Get-Content C:\cmake-cache-summary.txt)
+            notIncluded = @('nvngx_dlssnr.dll (NVIDIA neural denoise runtime; not publicly distributed)',
+                            'RTX Video SDK runtimes nvngx_vsr.dll / nvngx_truehdr.dll (NVIDIA developer login)',
+                            'FidelityFX SDK 1.1.4 optical-flow libs', 'PS5 Remote Play / Moonlight / Xbox streaming (off by default in CMake)',
+                            'startup music BGM.MP3, VB-CABLE package (author-supplied binaries)')
+          }
+          $info | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 "$stage\BUILD-INFO.json"
+          Compress-Archive -Path $stage -DestinationPath "C:\out\$env:PKG.zip"
+          Compress-Archive -Path C:\out\vendor-runtime\* -DestinationPath C:\out\vendor-runtime-official-signed.zip
+          Get-ChildItem C:\out\*.zip | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName).Hash.ToLowerInvariant(), $_.Name } |
+            Set-Content -Encoding utf8 C:\out\SHA256SUMS.txt
+          Copy-Item "$stage\BUILD-INFO.json" C:\out\
+          "### Artifacts`n``````" >> $env:GITHUB_STEP_SUMMARY
+          Get-Content C:\out\SHA256SUMS.txt >> $env:GITHUB_STEP_SUMMARY
+          "veyra_qml_ui.exe  $((Get-FileHash "$stage\veyra_qml_ui.exe").Hash.ToLowerInvariant())" >> $env:GITHUB_STEP_SUMMARY
+          "``````" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Microsoft Defender scan of this build
+        id: defender
+        run: |
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          $PSNativeCommandUseErrorActionPreference = $false
+          & $mp -SignatureUpdate | Out-Host
+          & $mp -SignatureUpdate -MMPC | Out-Host
+          & $mp -Scan -ScanType 3 -File C:\out -DisableRemediation | Tee-Object C:\out\defender-build.txt
+          $code = $LASTEXITCODE
+          "Defender exit code: $code (0 = no threats, 2 = threats found)" | Tee-Object -Append C:\out\defender-build.txt
+          "Defender (this build): exit $code" >> $env:GITHUB_STEP_SUMMARY
+          "code=$code" >> $env:GITHUB_OUTPUT
+
+      - name: Upload build
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: veyra-independent-build
+          path: |
+            C:\out\*.zip
+            C:\out\SHA256SUMS*.txt
+            C:\out\BUILD-INFO.json
+            C:\out\defender-build.txt
+          if-no-files-found: warn
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            C:\out\*.zip
+            ${{ env.STAGE }}\veyra_qml_ui.exe
+
+      - name: Fail on Defender detection
+        if: steps.defender.outputs.code != '0'
+        run: throw "Defender reported threats or failed (exit ${{ steps.defender.outputs.code }})"
+
+  official-release-scan:
+    name: Scan official ${{ inputs.official_tag || 'v2.1.9' }} release (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        # Stop on the first failing cmdlet or native command (pwsh does not by default).
+        shell: pwsh -NoProfile -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+    steps:
+      - name: Download official release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force C:\official\assets, C:\official\x | Out-Null
+          gh release view $env:OFFICIAL_TAG -R $env:UPSTREAM_REPO --json assets --jq '.assets[] | [.name, .size, .digest] | @tsv' |
+            Tee-Object C:\official\assets.tsv
+          gh release download $env:OFFICIAL_TAG -R $env:UPSTREAM_REPO -D C:\official\assets
+          # GitHub-recorded digest vs downloaded bytes
+          $rows = foreach ($line in Get-Content C:\official\assets.tsv) {
+            $n, $s, $d = $line -split "`t"
+            $h = 'sha256:' + (Get-FileHash -LiteralPath "C:\official\assets\$n").Hash.ToLowerInvariant()
+            [pscustomobject]@{ asset = $n; githubDigest = $d; downloaded = $h; match = ($d -eq $h) }
+          }
+          $rows | Format-Table -AutoSize | Out-String -Width 400 | Tee-Object C:\official\asset-digests.txt
+          Get-ChildItem C:\official\assets -Filter *.zip | ForEach-Object {
+            Expand-Archive -LiteralPath $_.FullName -DestinationPath (Join-Path C:\official\x $_.BaseName) -Force
+          }
+
+      - name: Authenticode + hash inventory of every PE file
+        run: |
+          $pe = Get-ChildItem C:\official\x -Recurse -File | Where-Object { $_.Extension -in '.exe', '.dll', '.sys', '.ocx', '.node' }
+          $rows = foreach ($f in $pe) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $f.FullName
+            [pscustomobject]@{
+              file = $f.FullName.Substring(13); bytes = $f.Length
+              sha256 = (Get-FileHash -LiteralPath $f.FullName).Hash.ToLowerInvariant()
+              signature = $sig.Status; signer = $sig.SignerCertificate.Subject
+              version = $f.VersionInfo.FileVersion
+            }
+          }
+          $rows | Export-Csv -NoTypeInformation C:\official\pe-inventory.csv
+          $rows | Where-Object signature -ne 'Valid' | Format-Table file, signature, sha256 -AutoSize | Out-String -Width 400 |
+            Tee-Object C:\official\unsigned-or-invalid.txt
+          "### Official release: PE files without a valid signature" >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY; Get-Content C:\official\unsigned-or-invalid.txt >> $env:GITHUB_STEP_SUMMARY; '```' >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Microsoft Defender scan of official release
+        run: |
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          $PSNativeCommandUseErrorActionPreference = $false
+          & $mp -SignatureUpdate | Out-Host
+          & $mp -SignatureUpdate -MMPC | Out-Host
+          & $mp -Scan -ScanType 3 -File C:\official -DisableRemediation | Tee-Object C:\official\defender-official.txt
+          "Defender exit code: $LASTEXITCODE (0 = no threats, 2 = threats found)" | Tee-Object -Append C:\official\defender-official.txt
+          "Defender (official release): exit $LASTEXITCODE" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: official-release-scan
+          path: |
+            C:\official\*.txt
+            C:\official\*.tsv
+            C:\official\*.csv
+
+  clamav-and-compare:
+    name: ClamAV scan + compare with official release
+    needs: [build, official-release-scan]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout CI scripts
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          path: ci-repo
+          persist-credentials: false
+
+      - name: Checkout upstream source + helper repos
+        run: |
+          set -eu
+          fetch() { git init -q "$3"; git -C "$3" remote add origin "https://github.com/$1.git"; git -C "$3" fetch -q --depth 1 origin "$2"; git -C "$3" checkout -q FETCH_HEAD; }
+          fetch "$UPSTREAM_REPO" "$VEYRA_REF" scan/source-veyra
+          fetch perseval-BLR/NeuralScreen 9d6948c2b8f27987aac584f8d2b09e73c17c94e5 scan/source-neuralscreen
+          git clone -q --depth 1 https://github.com/smoovplay/smoovplay.git scan/source-smoovplay
+
+      - name: Download this build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: veyra-independent-build
+          path: scan/build
+
+      - name: Download official release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir -p scan/official
+          gh release download "$OFFICIAL_TAG" -R "$UPSTREAM_REPO" -D scan/official
+          for z in scan/official/*.zip; do unzip -q -o "$z" -d "scan/official/x/$(basename "$z" .zip)"; done
+          for z in scan/build/*.zip; do [ -f "$z" ] && unzip -q -o "$z" -d "scan/build/x/$(basename "$z" .zip)"; done || true
+
+      - name: ClamAV scan (fresh signatures)
+        run: |
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo apt-get install -y -qq clamav clamav-freshclam
+          sudo systemctl stop clamav-freshclam || true
+          sudo freshclam
+          set +e
+          clamscan -r -i --max-filesize=400M --max-scansize=1000M --alert-broken-media=no scan | tee clamav-report.txt
+          code=${PIPESTATUS[0]}
+          echo "ClamAV exit code: $code (0 = clean, 1 = virus found, 2 = error)" | tee -a clamav-report.txt
+          { echo '### ClamAV'; echo '```'; tail -15 clamav-report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compare this build with the official package
+        run: python3 -I ci-repo/ci/compare-packages.py scan/build/x scan/official/x compare-report.md && cat compare-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: clamav-and-compare
+          path: |
+            clamav-report.txt
+            compare-report.md
