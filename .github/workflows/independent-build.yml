@@ -100,7 +100,8 @@ jobs:
           "OVERLAY_HASH=$keyHash" >> $env:GITHUB_ENV
 
       - name: Restore vcpkg binary cache
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        id: vcpkg-cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: C:\vcache
           key: vcpkg-${{ env.VCPKG_COMMIT }}-${{ env.OVERLAY_HASH }}-v1
@@ -116,7 +117,13 @@ jobs:
             'libass:x64-windows-static-md'
           C:\v\vcpkg.exe list | Tee-Object C:\vcpkg-list.txt
           if (-not (Test-Path C:\v\installed\x64-windows\include\libavfilter\avfilter.h)) { throw 'avfilter missing' }
-          Select-String -Path C:\v\buildtrees\ffmpeg\src\*\libavcodec\h264dec.h -Pattern 'MAX_SLICES 256' -ErrorAction SilentlyContinue | Out-Null
+
+      - name: Save vcpkg binary cache
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: C:\vcache
+          key: vcpkg-${{ env.VCPKG_COMMIT }}-${{ env.OVERLAY_HASH }}-v1
 
       - name: Configure (CMake preset x64-release)
         working-directory: veyra
