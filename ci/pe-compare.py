@@ -46,7 +46,8 @@ def load(path):
     for s in pe.sections:
         name = s.Name.rstrip(b'\0').decode(errors='replace')
         data = s.get_data()
-        secs[name] = dict(data=data, va=s.VirtualAddress, raw=s.PointerToRawData, size=len(data),
+        flags = ''.join(c for c, bit in (('R', 0x40000000), ('W', 0x80000000), ('X', 0x20000000)) if s.Characteristics & bit)
+        secs[name] = dict(data=data, va=s.VirtualAddress, raw=s.PointerToRawData, size=len(data), flags=flags,
                           sha=hashlib.sha256(data).hexdigest(), ent=entropy(data[:4_000_000]))
     imps = set()
     for attr in ('DIRECTORY_ENTRY_IMPORT', 'DIRECTORY_ENTRY_DELAY_IMPORT'):
@@ -116,18 +117,18 @@ for m in mods:
     ref = max(refs, key=lambda r: (similarity(secs, r[2]), -abs(len(r[0]['path']) - len(x['path']))))
     rx, rpe, rsecs, rimps, rexps = ref
     L.append(f"Closest NVIDIA-signed reference: **{rx['label']}** (`{rx['sha256'][:16]}…`, version {rx.get('version','')})")
-    L += ['', '| section | size (mod / ref) | identical | differing bytes | entropy mod/ref |', '|---|---|---|---|---|']
+    L += ['', '| section | flags (mod / ref) | size (mod / ref) | identical | differing bytes | entropy mod/ref |', '|---|---|---|---|---|---|']
     text_ranges = None
     for name in sorted(set(secs) | set(rsecs)):
         a, b = secs.get(name), rsecs.get(name)
         if not a or not b:
-            L.append(f"| {name} | {a and a['size']} / {b and b['size']} | ADDED/REMOVED | – | – |")
+            L.append(f"| {name} | {a and a['flags']} / {b and b['flags']} | {a and a['size']} / {b and b['size']} | ADDED/REMOVED{' **EXECUTABLE**' if (a or b)['flags'].count('X') else ''} | – | – |")
             continue
         same = a['sha'] == b['sha']
         total, ranges = (0, []) if same else diff_ranges(a['data'], b['data'])
         if name == '.text' and not same:
             text_ranges = (ranges, a, b)
-        L.append(f"| {name} | {a['size']} / {b['size']} | {'yes' if same else 'no'} | {total} | {a['ent']:.2f} / {b['ent']:.2f} |")
+        L.append(f"| {name} | {a['flags']} / {b['flags']} | {a['size']} / {b['size']} | {'yes' if same else 'no'} | {total} | {a['ent']:.2f} / {b['ent']:.2f} |")
     new_imps = sorted(imps - rimps)
     gone_imps = sorted(rimps - imps)
     L += ['', f"Imports added: {len(new_imps)}  removed: {len(gone_imps)}"]
@@ -136,6 +137,8 @@ for m in mods:
         L.append(f"- + `{d}!{f}`{flag}")
     for d, f in gone_imps:
         L.append(f"- − `{d}!{f}`")
+    ep = (pe.OPTIONAL_HEADER.AddressOfEntryPoint, rpe.OPTIONAL_HEADER.AddressOfEntryPoint)
+    L.append(f"Entry point mod/ref: {ep[0]:#x} / {ep[1]:#x} {'(same)' if ep[0] == ep[1] else '**CHANGED**'}")
     L.append(f"Exports added: {sorted(exps - rexps)}  removed: {sorted(rexps - exps)}")
     if text_ranges:
         ranges, a, b = text_ranges
