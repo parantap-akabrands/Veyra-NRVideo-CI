@@ -1,3 +1,139 @@
+# Install Veyra 2.1.9 from the independent build
+
+> This branch builds Veyra from the author's source on GitHub's own servers,
+> instead of using the author's prebuilt EXE. The build log, SHA-256 hashes, a
+> signed provenance attestation and Defender/ClamAV scans are public. How the
+> build works is described in [ci/README.md](ci/README.md). The upstream
+> project README follows below the line.
+
+## Requirements
+
+- Windows 10 or 11, 64-bit
+- An NVIDIA RTX GPU with a current Game Ready / Studio driver. These steps
+  assume an RTX 50 (Blackwell) card such as the RTX 5060 Ti, which needs no
+  community-modified DLLs.
+- A capture card (Elgato, AVerMedia or another UVC device; Magewell, see Troubleshooting)
+- About 2 GB of free disk space
+- Optional: [GitHub CLI](https://cli.github.com/) (`winget install GitHub.cli`), to verify the download
+
+## 1. Download the independent build
+
+1. Open the [workflow runs](https://github.com/parantap-akabrands/Veyra-NRVideo-CI/actions/workflows/independent-build.yml)
+   and pick the latest run with a green check (you need to be signed in to GitHub).
+2. Under **Artifacts**, download **veyra-independent-build** and unzip it. It contains:
+   - `Veyra-independent-b430d986c2.zip`: the app
+   - `SHA256SUMS.txt`, `BUILD-INFO.json`, `defender-build.txt`
+   - `vendor-runtime-official-signed.zip`: not needed, ignore it
+3. Artifacts expire after 90 days. If the list is empty, open **Run workflow**
+   on that page to build it again.
+
+Expected SHA-256 for the 2.1.9 build (run 44569485521):
+
+| File | SHA-256 |
+|---|---|
+| `Veyra-independent-b430d986c2.zip` | `0cd49ff549d0ad138391f8bfbcad46b5ea16bf54b555b83e409d1ce56b6d371d` |
+| `veyra_qml_ui.exe` | `aa359bcf41df8d546d7a0841455d0a82fef38d67a734e6f948f42ebcdbb04e58` |
+
+A later run produces a different hash; compare it against that run's own
+`SHA256SUMS.txt` and log.
+
+## 2. Verify it (recommended)
+
+In PowerShell, in the folder you unzipped to:
+
+```powershell
+gh auth login
+gh attestation verify .\Veyra-independent-b430d986c2.zip -R parantap-akabrands/Veyra-NRVideo-CI
+```
+
+`Verification succeeded` means the zip was produced by this repository's
+workflow from the pinned source, and has not been changed since.
+
+## 3. Download the official package (only for NVIDIA's signed GPU runtimes)
+
+Download `Veyra-2.1.9-NVIDIA-win64-portable.zip` from the official
+[v2.1.9 release](https://github.com/Likely7/Veyra-NRVideo/releases/tag/v2.1.9).
+Its EXE is **not** used. Only NVIDIA-, Intel- and AMD-signed runtime files are
+taken from it in the next step.
+
+## 4. Assemble
+
+1. Download [`assemble-local.ps1`](https://raw.githubusercontent.com/parantap-akabrands/Veyra-NRVideo-CI/ci/independent-build/ci/assemble-local.ps1)
+   into the same folder (right-click → *Save link as*).
+2. Run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\assemble-local.ps1 `
+  -IndependentZip .\Veyra-independent-b430d986c2.zip `
+  -OfficialZip   .\Veyra-2.1.9-NVIDIA-win64-portable.zip `
+  -Destination   C:\Veyra
+```
+
+The script:
+- stops if the official zip's SHA-256 is not `4225ecb1…` (the value GitHub recorded for the release);
+- copies our build to `C:\Veyra`;
+- adds only GPU runtime DLLs with a **valid** NVIDIA/Intel/AMD signature, including
+  NVIDIA's own `nr-original\nvngx_dlssnr.dll` (310.8.0) used on RTX 50;
+- refuses every unsigned or modified DLL/EXE and lists them;
+- writes `C:\Veyra\ASSEMBLY-REPORT.txt` with everything it copied or refused.
+
+The destination folder must not exist yet. Running the script again with a new
+folder is safe.
+
+## 5. Run
+
+1. Connect the capture card and start `C:\Veyra\veyra_qml_ui.exe`.
+2. Windows SmartScreen will warn because the EXE is not code-signed:
+   **More info → Run anyway**.
+3. Select the capture card as the source and turn on the effects you want.
+
+### Optional: run inside Sandboxie-Plus
+
+1. Create a **standard** box (not *Security Hardened*).
+2. Box options → **Network** → block internet access. Veyra needs no network to
+   play from a capture card.
+3. Allow access to `C:\Veyra` and to the folder where you save recordings.
+4. Right-click `veyra_qml_ui.exe` → *Run Sandboxed*.
+
+GPU effects run at normal speed in the sandbox. The virtual camera and VB-CABLE
+installers, G-SYNC profile writing and game-mode hotkeys may not work there.
+
+## Updating and uninstalling
+
+- **Update:** run the workflow with a newer upstream commit (`veyra_ref`), then
+  repeat steps 1-4 into a new folder. Do not use the author's updater/release
+  EXE in place of it.
+- **Settings and logs** live inside the app folder: settings in
+  `C:\Veyra\runtime_local\user-data-2.0.0`, logs in `C:\Veyra\logs`. To keep
+  your settings, copy `user-data-2.0.0` into the new folder's `runtime_local`.
+- **Uninstall:** delete `C:\Veyra`. If you used the streaming features, also
+  delete `%LOCALAPPDATA%\Veyra`. Nothing is installed into Windows unless you
+  used the virtual camera or VB-CABLE installers from inside the app.
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `Official zip SHA-256 … does not match` | Download the zip again from the release page; do not use a mirror. |
+| Defender or another antivirus flags the EXE | Veyra patches NVIDIA DLLs in memory to unlock features on older GPUs (this code is inactive on RTX 50). Compare the EXE hash with the table above; if it matches, it is the audited build. |
+| Magewell card not detected | The official package's `LibMWCapture.dll` is unsigned, so the script refuses it. Install Magewell's own driver/SDK. |
+| Denoise (NR) or frame generation does not start | Update the NVIDIA driver, check `ASSEMBLY-REPORT.txt` for refused files, and read `C:\Veyra\logs\veyra-qml.log`. |
+| Missing feature vs the official build | Not included here: PS5 Remote Play / Moonlight / Xbox streaming, AMD-only runtimes, the startup music. |
+
+## What was checked
+
+- **Source review:** a review of the Veyra source for malware, keyloggers, data
+  exfiltration, injection and persistence found none.
+- **Build:** runs on a clean GitHub windows-2022 runner. Every dependency is
+  fetched from its vendor at a pinned commit.
+- **Scans:** Microsoft Defender and ClamAV are clean for this build and for the
+  official release.
+- **Community DLLs:** they are diffed against NVIDIA's signed originals (see the
+  *Community binaries provenance* workflow) and are not needed on RTX 50.
+- **Limits:** no review can guarantee software is 100% safe.
+
+---
+
 <div align="center">
 
 <img src="assets/veyra-wordmark-sun.gif" alt="Veyra NR · transparent animated wordmark and sun" width="480">
