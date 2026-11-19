@@ -9,6 +9,11 @@ name: Independent Veyra build + security scan
 on:
   push:
     branches: ['ci/**']
+    paths:
+      - '.github/workflows/independent-build.yml'
+      - 'ci/fetch-sdks.ps1'
+      - 'ci/make-ffmpeg-overlay.py'
+      - 'ci/compare-packages.py'
   workflow_dispatch:
     inputs:
       veyra_ref:
