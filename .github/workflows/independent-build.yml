@@ -231,6 +231,8 @@ jobs:
           Get-ChildItem C:\out\*.zip | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName).Hash.ToLowerInvariant(), $_.Name } |
             Set-Content -Encoding utf8 C:\out\SHA256SUMS.txt
           Copy-Item "$stage\BUILD-INFO.json" C:\out\
+          Write-Host '--- SHA256SUMS.txt'; Get-Content C:\out\SHA256SUMS.txt | Write-Host
+          Write-Host "veyra_qml_ui.exe  $((Get-FileHash "$stage\veyra_qml_ui.exe").Hash.ToLowerInvariant())"
           "### Artifacts`n``````" >> $env:GITHUB_STEP_SUMMARY
           Get-Content C:\out\SHA256SUMS.txt >> $env:GITHUB_STEP_SUMMARY
           "veyra_qml_ui.exe  $((Get-FileHash "$stage\veyra_qml_ui.exe").Hash.ToLowerInvariant())" >> $env:GITHUB_STEP_SUMMARY
@@ -371,7 +373,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          mkdir -p scan/official
+          mkdir -p scan/official/x scan/build/x
           gh release download "$OFFICIAL_TAG" -R "$UPSTREAM_REPO" -D scan/official
           for z in scan/official/*.zip; do unzip -q -o "$z" -d "scan/official/x/$(basename "$z" .zip)"; done
           for z in scan/build/*.zip; do [ -f "$z" ] && unzip -q -o "$z" -d "scan/build/x/$(basename "$z" .zip)"; done || true
