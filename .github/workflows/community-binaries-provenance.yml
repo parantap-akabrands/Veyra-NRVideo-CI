@@ -1,0 +1,65 @@
+name: Community binaries provenance
+
+# For every DLL/EXE in the official Veyra release packages, find the public
+# file it came from (vendor repo or community release), check Authenticode,
+# scan with Microsoft Defender, and diff community-modified nvngx_dlssnr.dll
+# builds against NVIDIA-signed originals to show what was changed.
+# Binaries are only downloaded onto the runner; only text reports are uploaded.
+
+on:
+  push:
+    branches: ['ci/**']
+    paths:
+      - '.github/workflows/community-binaries-provenance.yml'
+      - 'ci/pe-compare.py'
+      - 'ci/provenance.ps1'
+  workflow_dispatch:
+    inputs:
+      official_tag:
+        description: 'Official Veyra release tag'
+        default: 'v2.1.9'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provenance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  provenance:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh -NoProfile -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OFFICIAL_TAG: ${{ inputs.official_tag || 'v2.1.9' }}
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          persist-credentials: false
+
+      - name: Python tools (pefile, capstone; hash-pinned)
+        run: |
+          python -m pip install --quiet --require-hashes -r ci/requirements-pe.txt
+
+      - name: Collect official and public binaries, match, scan
+        run: ci/provenance.ps1 -Work D:\prov
+
+      - name: Diff community nvngx_dlssnr.dll builds against NVIDIA-signed originals
+        run: |
+          python -I ci/pe-compare.py D:\prov\dlssnr-inventory.json D:\prov\dlssnr-diff.md
+          Get-Content D:\prov\dlssnr-diff.md >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload text reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: community-binaries-provenance
+          path: |
+            D:\prov\*.md
+            D:\prov\*.csv
+            D:\prov\*.txt
+            D:\prov\*.json
