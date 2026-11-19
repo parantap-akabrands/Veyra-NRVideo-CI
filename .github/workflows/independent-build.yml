@@ -119,7 +119,7 @@ jobs:
           New-Item -ItemType Directory -Force C:\vcache | Out-Null
           C:\v\vcpkg.exe install --overlay-ports=C:\vcpkg-overlay --clean-after-build `
             'ffmpeg[core,avcodec,avformat,avfilter,swresample,swscale,dav1d,zlib]:x64-windows' `
-            'libass:x64-windows-static-md'
+            'libass:x64-windows-static'
           C:\v\vcpkg.exe list | Tee-Object C:\vcpkg-list.txt
           if (-not (Test-Path C:\v\installed\x64-windows\include\libavfilter\avfilter.h)) { throw 'avfilter missing' }
 
@@ -133,7 +133,7 @@ jobs:
       - name: Configure (CMake preset x64-release)
         working-directory: veyra
         run: |
-          $libass = 'C:/v/installed/x64-windows-static-md'
+          $libass = 'C:/v/installed/x64-windows-static'
           cmake --preset x64-release -B C:\b `
             -DVEYRA_BUILD_QML_UI=ON `
             -DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON `
@@ -173,7 +173,7 @@ jobs:
           Copy-Item veyra\licenses\* "$stage\licenses" -Recurse
           Copy-Item C:\v\installed\x64-windows\share\ffmpeg\copyright "$stage\licenses\FFMPEG-COPYRIGHT.txt"
           Copy-Item C:\v\installed\x64-windows\share\dav1d\copyright "$stage\licenses\DAV1D-COPYRIGHT.txt"
-          Copy-Item C:\v\installed\x64-windows-static-md\share\libass\copyright "$stage\licenses\LIBASS-COPYRIGHT.txt"
+          Copy-Item C:\v\installed\x64-windows-static\share\libass\copyright "$stage\licenses\LIBASS-COPYRIGHT.txt"
           "STAGE=$stage" >> $env:GITHUB_ENV
           "PKG=$name" >> $env:GITHUB_ENV
 
