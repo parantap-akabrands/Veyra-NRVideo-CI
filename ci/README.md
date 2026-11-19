@@ -33,3 +33,24 @@ Not included, because there is no public source for them: `nvngx_dlssnr.dll`
 SDK runtimes, FidelityFX 1.1.4 optical-flow libraries, the PS5, Moonlight and
 Xbox streaming backends (off by default), the startup music and the VB-CABLE
 package.
+
+## Assembling a runnable copy on your PC
+
+`ci/assemble-local.ps1` combines the independent build with the GPU runtimes
+from the official release zip, without trusting the author's binaries:
+
+1. It checks the official zip against GitHub's recorded SHA-256 (`4225ecb1…` for
+   `Veyra-2.1.9-NVIDIA-win64-portable.zip`).
+2. It copies files from `runtime/` and `runtime_local/` only if they carry a
+   valid Authenticode signature from NVIDIA, Intel or AMD, or are non-executable
+   data. This includes NVIDIA's own signed `nr-original/nvngx_dlssnr.dll` 310.8.0,
+   which supports RTX 50 (Blackwell) natively.
+3. It refuses every unsigned or modified DLL/EXE: the community
+   `nr-ampere/nvngx_dlssnr.dll`, the unsigned Magewell DLL, and all of the
+   author's own binaries.
+4. It writes `ASSEMBLY-REPORT.txt` listing what was copied and what was refused.
+
+```powershell
+gh attestation verify .\Veyra-independent-b430d986c2.zip -R parantap-akabrands/Veyra-NRVideo-CI
+powershell -ExecutionPolicy Bypass -File .\assemble-local.ps1 -IndependentZip .\Veyra-independent-b430d986c2.zip -OfficialZip .\Veyra-2.1.9-NVIDIA-win64-portable.zip -Destination C:\Veyra
+```
